@@ -11,7 +11,7 @@ output/*
 __pycache__/
 *.py[cod]
 *.pyo
-
+*.pyc
 # Common OS detritus
 .DS_Store
 Thumbs.db

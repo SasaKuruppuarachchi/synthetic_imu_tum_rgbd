@@ -4,6 +4,7 @@
 
 A standalone utility for augmenting TUM RGB-D benchmark ROS 2 MCAP bags with a synthetic `/imu` topic derived from ground-truth camera poses.  No ROS 2 runtime is required at execution time.
 
+> IMU data which is vital for benchmarking VINS packages are missing in the freiburg3 datasets - [“Sensors: RGBD, IMU (not in freiburg3), Ground truth”](https://www.mrpt.org/robotics_datasets?utm_source=chatgpt.com)
 ---
 
 ## Overview
