@@ -1,3 +1,17 @@
-Input/
-output/
+# Input bags and generated output (user data — not tracked)
+Input/*
+!Input/readme.md
+output/*
+!output/readme.md
+
+# VS Code workspace files
 .vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Common OS detritus
+.DS_Store
+Thumbs.db

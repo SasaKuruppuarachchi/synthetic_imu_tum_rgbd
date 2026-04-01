@@ -1,12 +1,14 @@
 # Synthetic IMU generator for TUM RGB-D Dynamic dataset
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A standalone utility for augmenting TUM RGB-D benchmark ROS 2 MCAP bags with a synthetic `/imu` topic derived from ground-truth camera poses.  No ROS 2 runtime is required at execution time.
 
 ---
 
 ## Overview
 
-Ground-truth trajectories in the TUM RGB-D dataset are provided as rigid-body transforms on the `/tf` topic.  `syn_imu_tum` extracts these transforms, applies a kinematic differentiation pipeline to recover linear acceleration and angular velocity, adds a Kalibr-compatible stochastic noise model, and writes a new MCAP bag containing all original topics plus the synthesised `/imu` stream.
+Ground-truth trajectories in the TUM RGB-D dataset are provided as rigid-body transforms on the `/tf` topic.  `generate_imu_bag` extracts these transforms, applies a kinematic differentiation pipeline to recover linear acceleration and angular velocity, adds a Kalibr-compatible stochastic noise model, and writes a new MCAP bag containing all original topics plus the synthesised `/imu` stream.
 
 ---
 
@@ -77,11 +79,12 @@ This mode is useful when the dataset provides a dedicated IMU frame transform in
 ## Installation
 
 ```bash
-cd /workspaces/arrf/data/converted/mcap/tum/syn_imu_tum
+git clone https://github.com/SasaKuruppuarachchi/synthetic_imu_tum_rgbd.git
+cd synthetic_imu_tum_rgbd
 pip install -r requirements.txt
 ```
 
-Dependencies: `rosbags >= 0.9.0`, `numpy >= 1.21`, `scipy >= 1.7`, `ruamel.yaml`.
+Dependencies: `rosbags >= 0.11.0`, `numpy >= 1.21`, `scipy >= 1.7`, `ruamel.yaml`.
 
 ---
 
