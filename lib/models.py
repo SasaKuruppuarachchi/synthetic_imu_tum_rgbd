@@ -52,6 +52,7 @@ class ImuConfig:
     body_frame: str
     imu_frame: str
     imu_frame_mode: bool
+    rostopic: str
 
 
 class ProcessingError(RuntimeError):

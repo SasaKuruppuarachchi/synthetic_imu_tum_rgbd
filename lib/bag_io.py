@@ -150,6 +150,11 @@ def build_imu_raw_messages(
     return packed, gyro_var, accel_var
 
 
+def bag_has_imu(bag_path: Path) -> bool:
+    with Reader(bag_path) as reader:
+        return any(c.msgtype == IMU_MSGTYPE for c in reader.connections)
+
+
 def _clone_connection(writer: Writer, connection, typestore):
     kwargs = {}
     ext = getattr(connection, "ext", None)
@@ -188,6 +193,7 @@ def write_output_bag(
     imu_raw_messages: Sequence[tuple[int, bytes]],
     typestore,
     compress: bool,
+    imu_topic: str = "/imu",
 ) -> None:
     if output_bag.exists():
         raise ProcessingError(
@@ -203,7 +209,7 @@ def write_output_bag(
         for connection in reader.connections:
             conn_map[connection.id] = _clone_connection(writer, connection, typestore)
 
-        imu_conn = writer.add_connection("/imu", IMU_MSGTYPE, typestore=typestore, serialization_format="cdr")
+        imu_conn = writer.add_connection(imu_topic, IMU_MSGTYPE, typestore=typestore, serialization_format="cdr")
 
         imu_idx = 0
         imu_total = len(imu_raw_messages)
@@ -219,3 +225,9 @@ def write_output_bag(
             imu_ts, imu_raw = imu_raw_messages[imu_idx]
             writer.write(imu_conn, imu_ts, imu_raw)
             imu_idx += 1
+
+    metadata_path = output_bag / "metadata.yaml"
+    if metadata_path.exists():
+        metadata_path.write_text(
+            metadata_path.read_text().replace("offered_qos_profiles: []", "offered_qos_profiles: null")
+        )

@@ -52,6 +52,7 @@ def load_imu_config(config_path: Path) -> ImuConfig:
     body_frame = str(imu0.get("body_frame", "kinect"))
     imu_frame = str(imu0.get("imu_frame", "imu"))
     imu_frame_mode = bool(imu0.get("imu_frame_mode", False))
+    rostopic = str(imu0.get("rostopic", "/imu"))
 
     return ImuConfig(
         accelerometer_noise_density=float(imu0["accelerometer_noise_density"]),
@@ -64,4 +65,5 @@ def load_imu_config(config_path: Path) -> ImuConfig:
         body_frame=body_frame,
         imu_frame=imu_frame,
         imu_frame_mode=imu_frame_mode,
+        rostopic=rostopic,
     )

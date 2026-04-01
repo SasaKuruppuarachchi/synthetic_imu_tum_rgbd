@@ -14,6 +14,7 @@ from typing import Sequence
 from rosbags.typesys import Stores, get_typestore
 
 from lib.bag_io import (
+    bag_has_imu,
     build_imu_raw_messages,
     discover_input_bags,
     extract_tf_pose_samples,
@@ -41,6 +42,10 @@ def _process_one_bag(
 ) -> None:
     bag_name = bag_path.name
     print(f"\n=== Processing bag: {bag_name} ===")
+
+    if bag_has_imu(bag_path):
+        print(f"Skipping '{bag_name}': bag already contains IMU messages.")
+        return
 
     samples, tf_msg_count, bag_start_ns, bag_end_ns = extract_tf_pose_samples(bag_path, typestore)
     print(f"Found {tf_msg_count} /tf messages.")
@@ -86,6 +91,7 @@ def _process_one_bag(
         imu_raw_messages=imu_raw_messages,
         typestore=typestore,
         compress=compress,
+        imu_topic=imu_config.rostopic,
     )
     print(f"Wrote output bag: {output_bag}")
 
