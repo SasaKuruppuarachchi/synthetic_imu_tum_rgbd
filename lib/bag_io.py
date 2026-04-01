@@ -229,5 +229,5 @@ def write_output_bag(
     metadata_path = output_bag / "metadata.yaml"
     if metadata_path.exists():
         metadata_path.write_text(
-            metadata_path.read_text().replace("offered_qos_profiles: []", "offered_qos_profiles: null")
+            metadata_path.read_text().replace("offered_qos_profiles: []", "offered_qos_profiles: ''")
         )
