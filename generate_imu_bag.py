@@ -17,6 +17,7 @@ from lib.bag_io import (
     bag_has_imu,
     build_imu_raw_messages,
     discover_input_bags,
+    export_kalibr_yaml,
     extract_tf_pose_samples,
     write_output_bag,
 )
@@ -94,6 +95,9 @@ def _process_one_bag(
         imu_topic=imu_config.rostopic,
     )
     print(f"Wrote output bag: {output_bag}")
+
+    yaml_path = export_kalibr_yaml(output_bag, imu_config)
+    print(f"Wrote Kalibr IMU config: {yaml_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

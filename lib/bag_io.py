@@ -108,8 +108,13 @@ def build_imu_raw_messages(
     Vector3 = typestore.types["geometry_msgs/msg/Vector3"]
     Imu = typestore.types[IMU_MSGTYPE]
 
-    gyro_var = (imu_config.gyroscope_noise_density * np.sqrt(imu_config.update_rate)) ** 2
-    accel_var = (imu_config.accelerometer_noise_density * np.sqrt(imu_config.update_rate)) ** 2
+    if imu_config.smooth_imu_mode:
+        _small = 1e-8
+        gyro_var = _small
+        accel_var = _small
+    else:
+        gyro_var = (imu_config.gyroscope_noise_density * np.sqrt(imu_config.update_rate)) ** 2
+        accel_var = (imu_config.accelerometer_noise_density * np.sqrt(imu_config.update_rate)) ** 2
 
     orientation_cov = np.array([-1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
     gyro_cov = np.array([gyro_var, 0.0, 0.0, 0.0, gyro_var, 0.0, 0.0, 0.0, gyro_var], dtype=np.float64)
@@ -231,3 +236,36 @@ def write_output_bag(
         metadata_path.write_text(
             metadata_path.read_text().replace("offered_qos_profiles: []", "offered_qos_profiles: ''")
         )
+
+
+def export_kalibr_yaml(output_bag: Path, imu_config: "ImuConfig") -> Path:
+    """Write a Kalibr-compatible imu.yaml file alongside the output bag directory.
+
+    The file is placed at ``output_bag.parent / "imu.yaml"``.
+    """
+    # Reconstruct full 4x4 T_i_b from stored rotation and lever arm.
+    T_full = np.eye(4, dtype=np.float64)
+    T_full[:3, :3] = imu_config.T_i_b
+    T_full[:3, 3] = imu_config.r_i_b
+
+    rows = [list(map(float, row)) for row in T_full]
+
+    lines: list[str] = [
+        "imu0:",
+        f"  background: {imu_config.rostopic}",
+        "  transport_delay: 0.0",
+        f"  update_rate: {float(imu_config.update_rate)}",
+        f"  accelerometer_noise_density: {imu_config.accelerometer_noise_density}",
+        f"  accelerometer_random_walk: {imu_config.accelerometer_random_walk}",
+        f"  gyroscope_noise_density: {imu_config.gyroscope_noise_density}",
+        f"  gyroscope_random_walk: {imu_config.gyroscope_random_walk}",
+        "  T_i_b:",
+    ]
+    for row in rows:
+        formatted = "[" + ", ".join(f"{v:.10g}" for v in row) + "]"
+        lines.append(f"    - {formatted}")
+
+    yaml_text = "\n".join(lines) + "\n"
+    yaml_path = output_bag.parent / "imu.yaml"
+    yaml_path.write_text(yaml_text, encoding="utf-8")
+    return yaml_path

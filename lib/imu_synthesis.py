@@ -8,7 +8,7 @@ from typing import Sequence
 import numpy as np
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
-from scipy.spatial.transform import Slerp
+from scipy.spatial.transform import RotationSpline
 
 from lib.models import (
     GRAVITY_WORLD,
@@ -132,6 +132,24 @@ def remove_outliers(signal: np.ndarray, config: OutlierConfig) -> np.ndarray:
     return result
 
 
+def smooth_signal(signal: np.ndarray, window_size: int) -> np.ndarray:
+    """Apply a centered moving-average filter per axis with edge padding."""
+    if window_size <= 1:
+        return signal
+    if window_size % 2 == 0:
+        window_size += 1
+
+    kernel = np.ones(window_size, dtype=np.float64) / float(window_size)
+    pad = window_size // 2
+    smoothed = np.empty_like(signal)
+
+    for col in range(signal.shape[1]):
+        padded = np.pad(signal[:, col], (pad, pad), mode="edge")
+        smoothed[:, col] = np.convolve(padded, kernel, mode="valid")
+
+    return smoothed
+
+
 def synthesize_imu_samples(
     pose_samples: Sequence[PoseSample],
     bag_start_ns: int,
@@ -139,7 +157,7 @@ def synthesize_imu_samples(
     imu_config: ImuConfig,
     rng: np.random.Generator,
 ) -> list[ImuSample]:
-    """Full kinematic pipeline: differentiate at GT rate, transform, upsample, add noise."""
+    """Full kinematic pipeline: interpolate pose, differentiate at IMU rate, add noise."""
     if bag_end_ns <= bag_start_ns:
         raise ProcessingError("Invalid bag duration: end timestamp is not after start.")
 
@@ -160,58 +178,74 @@ def synthesize_imu_samples(
             quats_gt[i] = -quats_gt[i]
 
     rot_gt = R.from_quat(quats_gt)
-
-    vel_gt         = np.gradient(pos_gt, t_gt, axis=0)
-    accel_gt_world = np.gradient(vel_gt,  t_gt, axis=0)
-
-    omega_gt_world = np.zeros((t_gt.shape[0], 3), dtype=np.float64)
-    for i in range(1, t_gt.shape[0]):
-        dt_i = t_gt[i] - t_gt[i - 1]
-        delta_r = rot_gt[i] * rot_gt[i - 1].inv()
-        omega_gt_world[i] = delta_r.as_rotvec() / dt_i
-    omega_gt_world[0] = omega_gt_world[1]
-
-    accel_gt_world = remove_outliers(accel_gt_world, imu_config.outlier_filter)
-    omega_gt_world = remove_outliers(omega_gt_world, imu_config.outlier_filter)
-
-    accel_gt_body = np.zeros_like(accel_gt_world)
-    omega_gt_body = np.zeros_like(omega_gt_world)
-    for i in range(t_gt.shape[0]):
-        rot_inv = rot_gt[i].inv()
-        accel_gt_body[i] = rot_inv.apply(accel_gt_world[i] + GRAVITY_WORLD)
-        omega_gt_body[i] = rot_inv.apply(omega_gt_world[i])
-
-    if imu_config.imu_frame_mode:
-        accel_gt_imu = accel_gt_body
-        omega_gt_imu = omega_gt_body
-    else:
-        accel_gt_imu = (imu_config.T_i_b @ accel_gt_body.T).T
-        omega_gt_imu = (imu_config.T_i_b @ omega_gt_body.T).T
-
-    accel_cs  = CubicSpline(t_gt, accel_gt_imu, axis=0)
-    omega_cs  = CubicSpline(t_gt, omega_gt_imu, axis=0)
-    slerp_out = Slerp(t_gt, rot_gt)
+    pos_cs = CubicSpline(t_gt, pos_gt, axis=0)
+    rot_spline = RotationSpline(t_gt, rot_gt)
 
     dt_s  = 1.0 / imu_config.update_rate
     dt_ns = int(round(dt_s * 1e9))
 
-    imu_ts_ns = np.arange(bag_start_ns, bag_end_ns + 1, dt_ns, dtype=np.int64)
+    imu_start_ns = max(bag_start_ns, int(ts_gt_ns[0]))
+    imu_end_ns = min(bag_end_ns, int(ts_gt_ns[-1]))
+    if imu_end_ns <= imu_start_ns:
+        raise ProcessingError("No overlap between bag duration and TF pose range.")
+
+    imu_ts_ns = np.arange(imu_start_ns, imu_end_ns + 1, dt_ns, dtype=np.int64)
     if imu_ts_ns.size < 2:
-        imu_ts_ns = np.array([bag_start_ns, bag_end_ns], dtype=np.int64)
+        imu_ts_ns = np.array([imu_start_ns, imu_end_ns], dtype=np.int64)
 
-    imu_t_s    = np.clip(imu_ts_ns.astype(np.float64) * 1e-9, t_gt[0], t_gt[-1])
-    accel_imu  = accel_cs(imu_t_s)
-    omega_imu  = omega_cs(imu_t_s)
-    quats_xyzw = slerp_out(imu_t_s).as_quat()
+    imu_t_s = imu_ts_ns.astype(np.float64) * 1e-9
+    rot_imu = rot_spline(imu_t_s)
+    quats_xyzw = rot_imu.as_quat()
 
-    noisy_gyro, noisy_accel, _, _ = apply_imu_noise(omega_imu, accel_imu, imu_config, rng)
+    accel_world = pos_cs(imu_t_s, 2)
+    accel_world = remove_outliers(accel_world, imu_config.outlier_filter)
+    accel_smooth_window = max(3, int(round(0.10 * imu_config.update_rate)))
+    accel_world = smooth_signal(accel_world, accel_smooth_window)
+
+    accel_body = np.zeros_like(accel_world)
+    for i in range(imu_t_s.shape[0]):
+        accel_body[i] = rot_imu[i].inv().apply(accel_world[i] + GRAVITY_WORLD)
+
+    omega_body = np.zeros((imu_t_s.shape[0], 3), dtype=np.float64)
+    if imu_t_s.shape[0] >= 2:
+        for i in range(1, imu_t_s.shape[0]):
+            dt_i = imu_t_s[i] - imu_t_s[i - 1]
+            delta_r = rot_imu[i - 1].inv() * rot_imu[i]
+            omega_body[i] = delta_r.as_rotvec() / dt_i
+        omega_body[0] = omega_body[1]
+    omega_body = remove_outliers(omega_body, imu_config.outlier_filter)
+    omega_smooth_window = max(3, int(round(0.05 * imu_config.update_rate)))
+    omega_body = smooth_signal(omega_body, omega_smooth_window)
+
+    if imu_config.imu_frame_mode:
+        accel_imu = accel_body
+        omega_imu = omega_body
+    else:
+        R_ib = imu_config.T_i_b   # (3,3) rotation: body -> IMU
+        r_ib = imu_config.r_i_b   # (3,) lever arm in body frame
+
+        # Angular acceleration via central differences (uniform IMU-rate grid)
+        alpha_body = np.gradient(omega_body, imu_t_s, axis=0)  # shape (N, 3)
+
+        # Full rigid-body lever-arm kinematics (vectorised):
+        #   f_i = R_ib @ (f_b + alpha_b x r_ib + omega_b x (omega_b x r_ib))
+        coriolis = np.cross(alpha_body, r_ib)  # (N, 3) tangential
+        centripetal = np.cross(omega_body, np.cross(omega_body, r_ib))  # (N, 3)
+        accel_imu = (R_ib @ (accel_body + coriolis + centripetal).T).T
+        omega_imu = (R_ib @ omega_body.T).T
+
+    if imu_config.smooth_imu_mode:
+        final_gyro = omega_imu
+        final_accel = accel_imu
+    else:
+        final_gyro, final_accel, _, _ = apply_imu_noise(omega_imu, accel_imu, imu_config, rng)
 
     return [
         ImuSample(
             timestamp_ns=int(ts_ns),
             quat_xyzw=quats_xyzw[i],
-            angular_velocity=noisy_gyro[i],
-            linear_acceleration=noisy_accel[i],
+            angular_velocity=final_gyro[i],
+            linear_acceleration=final_accel[i],
         )
         for i, ts_ns in enumerate(imu_ts_ns)
     ]

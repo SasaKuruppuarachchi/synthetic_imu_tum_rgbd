@@ -62,3 +62,4 @@ imu0:
   body_frame: "openni_rgb_frame"
   imu_frame: "kinect"
   imu_frame_mode: true
+  smooth_imu_mode: false

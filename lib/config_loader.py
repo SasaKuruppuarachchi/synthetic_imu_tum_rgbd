@@ -52,6 +52,7 @@ def load_imu_config(config_path: Path) -> ImuConfig:
     body_frame = str(imu0.get("body_frame", "kinect"))
     imu_frame = str(imu0.get("imu_frame", "imu"))
     imu_frame_mode = bool(imu0.get("imu_frame_mode", False))
+    smooth_imu_mode = bool(imu0.get("smooth_imu_mode", False))
     rostopic = str(imu0.get("rostopic", "/imu"))
 
     return ImuConfig(
@@ -61,9 +62,11 @@ def load_imu_config(config_path: Path) -> ImuConfig:
         gyroscope_random_walk=float(imu0["gyroscope_random_walk"]),
         update_rate=float(imu0["update_rate"]),
         T_i_b=t_i_b[:3, :3],
+        r_i_b=t_i_b[:3, 3],
         outlier_filter=outlier_config,
         body_frame=body_frame,
         imu_frame=imu_frame,
         imu_frame_mode=imu_frame_mode,
+        smooth_imu_mode=smooth_imu_mode,
         rostopic=rostopic,
     )

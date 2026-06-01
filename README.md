@@ -46,9 +46,11 @@ $$\mathbf{f}_b = R_{wb}^{-1}\!\left(\ddot{\mathbf{p}}_w + \mathbf{g}_w\right), \
 
 Angular velocity is similarly rotated: $\boldsymbol{\omega}_b = R_{wb}^{-1}\boldsymbol{\omega}_w$.
 
-Both signals are then projected into the IMU sensor frame using the body-to-IMU rotation $R_{ib}$ from `T_i_b` in the calibration file:
+When `imu_frame_mode: false`, both signals are projected into the IMU sensor frame using the body-to-IMU calibration $R_{ib}$ and lever arm $\mathbf{r}_{ib}$ (translation column of `T_i_b`).  For accelerometers, the full rigid-body kinematics are applied:
 
-$$\mathbf{f}_i = R_{ib}\,\mathbf{f}_b, \qquad \boldsymbol{\omega}_i = R_{ib}\,\boldsymbol{\omega}_b$$
+$$\mathbf{f}_i = R_{ib}\!\left(\mathbf{f}_b + \dot{\boldsymbol{\omega}}_b \times \mathbf{r}_{ib} + \boldsymbol{\omega}_b \times (\boldsymbol{\omega}_b \times \mathbf{r}_{ib})\right), \qquad \boldsymbol{\omega}_i = R_{ib}\,\boldsymbol{\omega}_b$$
+
+where $\dot{\boldsymbol{\omega}}_b$ is the angular acceleration computed by `numpy.gradient` at the IMU rate.  The first cross-product is the tangential (Euler) acceleration; the second is the centripetal acceleration due to the lever arm.
 
 ### 4  Outlier removal
 
@@ -56,7 +58,7 @@ Before the frame transform, per-axis outliers in $\ddot{\mathbf{p}}$ and $\bolds
 
 ### 5  Upsampling to IMU rate
 
-The cleaned GT-rate signals are upsampled to 200 Hz using cubic-spline interpolation; orientation is upsampled with quaternion SLERP.
+The cleaned GT-rate signals are upsampled to 200 Hz using cubic-spline interpolation; orientation is upsampled with cubic `RotationSpline` (SO(3) cubic spline), which produces smooth, continuous angular velocity without the staircase discontinuities introduced by piecewise-linear SLERP.
 
 ### 6  Stochastic noise model
 
@@ -77,6 +79,36 @@ By default (`imu_frame_mode: false`) the pipeline extracts the `body_frame` tran
 When `imu_frame_mode: true`, the pipeline instead extracts the `imu_frame` transform directly from `/tf`.  Because the poses are already expressed in the IMU frame, $R_{ib}$ is disregarded and the `T_i_b` field has no effect.  The output `sensor_msgs/msg/Imu` `header.frame_id` is set to `imu_frame` in this mode.
 
 This mode is useful when the dataset provides a dedicated IMU frame transform in its TF tree, enabling a direct comparison against hardware-recorded IMU data without an additional rotational calibration step.
+
+### 8  Smooth IMU mode (`smooth_imu_mode`)
+
+When `smooth_imu_mode: true` in `config/kalibr_imu_chain.yaml`, the stochastic noise block (Step 6) is bypassed entirely.  The output `/imu` topic contains **perfect, deterministic, noise-free and bias-free** kinematic measurements — pure specific force and angular velocity.
+
+The `sensor_msgs/msg/Imu` covariance matrices are populated with $10^{-8} \cdot \mathbf{I}$ instead of the Kalibr discrete-noise variance, signalling an ideal sensor to downstream VIO/VINS pipelines.
+
+This mode is useful for algorithm development, unit testing, and verifying estimator consistency without the confounding effect of sensor noise.
+
+### 9  Kalibr calibration file export
+
+After each output bag is written, a Kalibr-compatible `imu.yaml` file is automatically generated in the same `output/` directory.  It is populated directly from `config/kalibr_imu_chain.yaml` and formatted exactly as Kalibr expects:
+
+```yaml
+imu0:
+    background: /camera/imu
+    transport_delay: 0.0
+    update_rate: 200.0
+    accelerometer_noise_density: <value>
+    accelerometer_random_walk: <value>
+    gyroscope_noise_density: <value>
+    gyroscope_random_walk: <value>
+    T_i_b:
+        - [...]
+        - [...]
+        - [...]
+        - [...]
+```
+
+The `T_i_b` matrix is the full 4×4 homogeneous transform reconstructed from the stored rotation $R_{ib}$ and lever arm $\mathbf{r}_{ib}$.
 
 ---
 
@@ -178,6 +210,15 @@ print(f'accel_noise_density: {cfg.accelerometer_noise_density}')
 print(f'update_rate        : {cfg.update_rate} Hz')
 print(f'outlier_filter     : {cfg.outlier_filter}')
 "
+
+# 6. Verify Kalibr imu.yaml was written alongside the output bag
+python -c "
+from pathlib import Path
+yaml_files = list(Path('output').glob('imu.yaml'))
+assert yaml_files, 'imu.yaml not found in output/'
+print('imu.yaml contents:')
+print(yaml_files[0].read_text())
+"
 ```
 
 ---
@@ -202,6 +243,8 @@ Key configurable fields under `imu0`:
 | `body_frame` | TF child frame name representing the sensor body (default `"kinect"`) |
 | `imu_frame` | TF child frame name of the physical IMU (default `"imu"`) |
 | `imu_frame_mode` | When `true`, extract poses from `imu_frame` TF directly and disregard `T_i_b` |
+| `smooth_imu_mode` | When `true`, bypass all stochastic noise; output ideal noise-free measurements with $10^{-8}$ covariance |
+| `imu.yaml` export | Automatically writes Kalibr-compatible `imu.yaml` alongside each output bag |
 
 ---
 
@@ -212,12 +255,14 @@ Generated `sensor_msgs/msg/Imu` fields:
 | Field | Value |
 |-------|-------|
 | `header.frame_id` | `"kinect"` |
-| `orientation` | SLERP-interpolated quaternion |
+| `orientation` | RotationSpline-interpolated quaternion |
 | `orientation_covariance[0]` | `-1` (unknown, per REP-145) |
 | `angular_velocity` | $\tilde{\boldsymbol{\omega}}_k$ (body frame, noisy) |
 | `angular_velocity_covariance` | Diagonal: $(\sigma_g^d)^2$ |
 | `linear_acceleration` | $\tilde{\mathbf{f}}_k$ (body frame, noisy, gravity-compensated) |
 | `linear_acceleration_covariance` | Diagonal: $(\sigma_a^d)^2$ |
+
+In `smooth_imu_mode`, `angular_velocity_covariance` and `linear_acceleration_covariance` diagonals are set to $10^{-8}$ instead of $(\sigma^d)^2$.
 
 ---
 

@@ -48,10 +48,12 @@ class ImuConfig:
     gyroscope_random_walk: float
     update_rate: float
     T_i_b: np.ndarray
+    r_i_b: np.ndarray
     outlier_filter: OutlierConfig
     body_frame: str
     imu_frame: str
     imu_frame_mode: bool
+    smooth_imu_mode: bool
     rostopic: str
 
 
