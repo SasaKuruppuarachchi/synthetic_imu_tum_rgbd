@@ -17,8 +17,13 @@ from lib.bag_io import (
     bag_has_imu,
     build_imu_raw_messages,
     discover_input_bags,
+    export_kalibr_imu_chain_yaml,
+    export_kalibr_imucam_chain_yaml,
     export_kalibr_yaml,
+    extract_camera_info,
+    extract_static_tf_tree,
     extract_tf_pose_samples,
+    lookup_transform,
     write_output_bag,
 )
 from lib.config_loader import load_imu_config
@@ -98,6 +103,55 @@ def _process_one_bag(
 
     yaml_path = export_kalibr_yaml(output_bag, imu_config)
     print(f"Wrote Kalibr IMU config: {yaml_path}")
+
+    # --- Per-bag Kalibr calibration files sourced from /tf_static ---
+    tf_tree = extract_static_tf_tree(bag_path, typestore)
+
+    # T_i_b: body_frame → imu_frame  (p_imu = T_i_b @ p_body)
+    body_frame = imu_config.body_frame
+    imu_frame  = imu_config.imu_frame
+    T_i_b_from_tf = lookup_transform(tf_tree, body_frame, imu_frame)
+    if T_i_b_from_tf is not None:
+        T_i_b_4x4 = T_i_b_from_tf
+        print(f"  T_i_b sourced from /tf_static ({body_frame} → {imu_frame})")
+    else:
+        T_i_b_4x4 = np.eye(4, dtype=np.float64)
+        T_i_b_4x4[:3, :3] = imu_config.T_i_b
+        T_i_b_4x4[:3, 3]  = imu_config.r_i_b
+        print(f"  T_i_b: /tf_static path '{body_frame}'→'{imu_frame}' not found, using config value.")
+
+    imu_chain_path = export_kalibr_imu_chain_yaml(output_bag, imu_config, T_i_b_4x4)
+    print(f"Wrote kalibr_imu_chain.yaml: {imu_chain_path}")
+
+    # T_cam_imu: imu_frame → cam_optical_frame  (p_cam = T_cam_imu @ p_imu)
+    cam_info = extract_camera_info(bag_path, typestore)
+    cam_optical_frame: str | None = None
+    if cam_info is not None:
+        cam_optical_frame = cam_info.get("frame_id")
+
+    if cam_optical_frame is None:
+        # Try known optical frame names in the TF tree
+        for candidate in ("openni_rgb_optical_frame", "camera_rgb_optical_frame",
+                          "openni_depth_optical_frame"):
+            if candidate in tf_tree:
+                cam_optical_frame = candidate
+                break
+
+    if cam_optical_frame is not None:
+        T_cam_imu = lookup_transform(tf_tree, imu_frame, cam_optical_frame)
+    else:
+        T_cam_imu = None
+
+    if T_cam_imu is not None and cam_info is not None:
+        imucam_path = export_kalibr_imucam_chain_yaml(output_bag, T_cam_imu, cam_info)
+        print(f"Wrote kalibr_imucam_chain.yaml: {imucam_path}")
+    else:
+        missing = []
+        if T_cam_imu is None:
+            missing.append(f"T_cam_imu (no /tf_static path from '{imu_frame}' to cam optical frame)")
+        if cam_info is None:
+            missing.append("camera_info (no sensor_msgs/msg/CameraInfo topic found)")
+        print(f"  Skipped kalibr_imucam_chain.yaml: {'; '.join(missing)}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

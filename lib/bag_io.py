@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from scipy.spatial.transform import Rotation as _Rotation
 from rosbags.rosbag2 import Reader, Writer
 from rosbags.rosbag2.enums import CompressionFormat, CompressionMode, StoragePlugin
 
@@ -267,5 +268,258 @@ def export_kalibr_yaml(output_bag: Path, imu_config: "ImuConfig") -> Path:
 
     yaml_text = "\n".join(lines) + "\n"
     yaml_path = output_bag.parent / "imu.yaml"
+    yaml_path.write_text(yaml_text, encoding="utf-8")
+    return yaml_path
+
+
+def _make_homogeneous(tx: float, ty: float, tz: float,
+                      rx: float, ry: float, rz: float, rw: float) -> np.ndarray:
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = _Rotation.from_quat([rx, ry, rz, rw]).as_matrix()
+    T[:3, 3] = [tx, ty, tz]
+    return T
+
+
+def extract_static_tf_tree(bag_path: Path, typestore) -> dict:
+    """Read /tf_static and /tf; return {child_frame: (parent_frame, T_4x4)}.
+
+    Static transforms (/tf_static) take priority.
+    For frames absent from /tf_static, the first occurrence on /tf is used
+    (correct for fixed camera-rig frames published on the dynamic topic).
+    T_4x4 satisfies: p_parent = T_4x4 @ p_child  (ROS TF convention).
+    """
+    tree: dict[str, tuple[str, np.ndarray]] = {}
+    first_dynamic: dict[str, tuple[str, np.ndarray]] = {}
+
+    with Reader(bag_path) as reader:
+        for connection, timestamp, rawdata in reader.messages():
+            if connection.topic not in ("/tf_static", "tf_static", "/tf", "tf"):
+                continue
+            tf_msg = deserialize(rawdata, TF_MSGTYPE, typestore)
+            is_static = connection.topic in ("/tf_static", "tf_static")
+            for ts in tf_msg.transforms:
+                child = ts.child_frame_id.strip().lstrip("/")
+                parent = ts.header.frame_id.strip().lstrip("/")
+                tr = ts.transform.translation
+                ro = ts.transform.rotation
+                T = _make_homogeneous(tr.x, tr.y, tr.z, ro.x, ro.y, ro.z, ro.w)
+                if is_static:
+                    tree[child] = (parent, T)
+                elif child not in first_dynamic:
+                    first_dynamic[child] = (parent, T)
+
+    # Fill gaps: frames only seen on /tf, not overwriting static entries
+    for child, entry in first_dynamic.items():
+        if child not in tree:
+            tree[child] = entry
+
+    return tree
+
+
+def lookup_transform(tree: dict, from_frame: str, to_frame: str) -> "np.ndarray | None":
+    """Return 4x4 T such that p_{to_frame} = T @ p_{from_frame}.
+
+    Returns None if no path exists between the two frames in the tree.
+    """
+    if from_frame == to_frame:
+        return np.eye(4, dtype=np.float64)
+
+    # Collect ancestors of from_frame (maps frame -> depth)
+    ancestors_from: dict[str, int] = {}
+    frame: str | None = from_frame
+    depth = 0
+    while frame is not None:
+        ancestors_from[frame] = depth
+        entry = tree.get(frame)
+        frame = entry[0] if entry else None
+        depth += 1
+
+    # Walk up from to_frame until we hit a known ancestor (= LCA)
+    path_to = [to_frame]
+    frame = to_frame
+    while frame not in ancestors_from:
+        entry = tree.get(frame)
+        if entry is None:
+            return None  # disconnected
+        frame = entry[0]
+        path_to.append(frame)
+    lca = frame
+
+    # Walk up from from_frame to LCA
+    path_from = [from_frame]
+    frame = from_frame
+    while frame != lca:
+        entry = tree.get(frame)
+        if entry is None:
+            return None
+        frame = entry[0]
+        path_from.append(frame)
+
+    # Compose: go UP from from_frame → LCA  (each stored T is T_parent_child)
+    T = np.eye(4, dtype=np.float64)
+    for i in range(len(path_from) - 1):
+        child_f = path_from[i]
+        _, T_pc = tree[child_f]      # p_parent = T_pc @ p_child
+        T = T_pc @ T
+
+    # Compose: go DOWN from LCA → to_frame  (use inverse of stored T)
+    # path_to is [to_frame, ..., lca]; path_to[:-1] reversed gives lca's side → to_frame
+    for child_f in reversed(path_to[:-1]):
+        _, T_pc = tree[child_f]      # p_parent = T_pc @ p_child  →  p_child = inv(T_pc) @ p_parent
+        T = np.linalg.inv(T_pc) @ T
+
+    return T
+
+
+def extract_camera_info(bag_path: Path, typestore) -> "dict | None":
+    """Return camera parameters from the first sensor_msgs/msg/CameraInfo message found.
+
+    Returns dict with keys: intrinsics, distortion, resolution, frame_id, distortion_model, rostopic.
+    Returns None if no camera_info topic exists in the bag.
+    """
+    CAM_MSGTYPE = "sensor_msgs/msg/CameraInfo"
+
+    preferred_topics = ["/camera/rgb/camera_info", "/camera/depth/camera_info"]
+    cam_topics: list[str] = []
+
+    with Reader(bag_path) as reader:
+        for conn in reader.connections:
+            if conn.msgtype == CAM_MSGTYPE:
+                if conn.topic in preferred_topics:
+                    cam_topics.insert(0, conn.topic)
+                else:
+                    cam_topics.append(conn.topic)
+
+    if not cam_topics:
+        return None
+
+    target_topic = cam_topics[0]
+
+    with Reader(bag_path) as reader:
+        cam_conns = [c for c in reader.connections if c.topic == target_topic]
+        for _, _, rawdata in reader.messages(connections=cam_conns):
+            msg = deserialize(rawdata, CAM_MSGTYPE, typestore)
+            K = list(msg.k)                   # 9 floats, row-major
+            D = list(msg.d)                   # variable length
+            w = int(msg.width)
+            h = int(msg.height)
+            fid = str(msg.header.frame_id).strip().lstrip("/")
+            dmodel_raw = str(getattr(msg, "distortion_model", "plumb_bob"))
+            dmodel = "radtan" if dmodel_raw in ("plumb_bob", "radtan") else dmodel_raw
+            # Infer image topic: camera_info topic → image topic heuristic
+            img_topic = target_topic.replace("camera_info", "image_color")
+            return {
+                "intrinsics": [K[0], K[4], K[2], K[5]],   # fx, fy, cx, cy
+                "distortion": D[:4] if len(D) >= 4 else D,
+                "resolution": [w, h],
+                "frame_id": fid,
+                "distortion_model": dmodel,
+                "rostopic": img_topic,
+            }
+
+    return None
+
+
+def export_kalibr_imu_chain_yaml(
+    output_bag: Path,
+    imu_config: "ImuConfig",
+    T_i_b_4x4: np.ndarray,
+) -> Path:
+    """Write a kalibr_imu_chain.yaml file inside the output bag directory.
+
+    Styled exactly like ref_calib/kalibr_imu_chain.yaml.
+    T_i_b_4x4 must satisfy p_imu = T_i_b_4x4 @ p_body.
+    """
+    def _fmt_row4(row):
+        return "[" + ", ".join(f"{v:.10g}" for v in row) + "]"
+
+    def _fmt_row3(row):
+        return "[" + ", ".join(f"{v:.10g}" for v in row) + "]"
+
+    rows4 = [list(map(float, T_i_b_4x4[i])) for i in range(4)]
+    I3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    Z3 = [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+
+    lines = [
+        "%YAML:1.0",
+        "",
+        "imu0:",
+        "  T_i_b:",
+    ]
+    for row in rows4:
+        lines.append(f"    - {_fmt_row4(row)}")
+    lines += [
+        f"  accelerometer_noise_density: {imu_config.accelerometer_noise_density}",
+        f"  accelerometer_random_walk: {imu_config.accelerometer_random_walk}",
+        f"  gyroscope_noise_density: {imu_config.gyroscope_noise_density}",
+        f"  gyroscope_random_walk: {imu_config.gyroscope_random_walk}",
+        f"  rostopic: {imu_config.rostopic}",
+        "  time_offset: 0.0",
+        f"  update_rate: {int(imu_config.update_rate)}",
+        '  model: "kalibr"',
+        "  Tw:",
+    ]
+    for row in I3:
+        lines.append(f"    - {_fmt_row3(row)}")
+    lines.append("  R_IMUtoGYRO:")
+    for row in I3:
+        lines.append(f"    - {_fmt_row3(row)}")
+    lines.append("  Ta:")
+    for row in I3:
+        lines.append(f"    - {_fmt_row3(row)}")
+    lines.append("  R_IMUtoACC:")
+    for row in I3:
+        lines.append(f"    - {_fmt_row3(row)}")
+    lines.append("  Tg:")
+    for row in Z3:
+        lines.append(f"    - {_fmt_row3(row)}")
+
+    yaml_text = "\n".join(lines) + "\n"
+    yaml_path = output_bag / "kalibr_imu_chain.yaml"
+    yaml_path.write_text(yaml_text, encoding="utf-8")
+    return yaml_path
+
+
+def export_kalibr_imucam_chain_yaml(
+    output_bag: Path,
+    T_cam_imu: np.ndarray,
+    cam_info: dict,
+) -> Path:
+    """Write a kalibr_imucam_chain.yaml file inside the output bag directory.
+
+    Styled exactly like ref_calib/kalibr_imucam_chain.yaml.
+    T_cam_imu must satisfy p_cam = T_cam_imu @ p_imu  (Kalibr convention).
+    cam_info: dict with keys intrinsics, distortion, resolution, distortion_model, rostopic.
+    """
+    def _fmt_row4(row):
+        vals = [f"{v:.6f}" for v in row]
+        return "[" + ", ".join(vals) + "]"
+
+    rows4 = [list(map(float, T_cam_imu[i])) for i in range(4)]
+    intr = cam_info["intrinsics"]    # [fx, fy, cx, cy]
+    dist = cam_info["distortion"]    # [k1, k2, p1, p2]
+    res  = cam_info["resolution"]    # [w, h]
+
+    lines = [
+        "%YAML:1.0",
+        "",
+        "cam0:",
+        "  T_cam_imu:",
+    ]
+    for row in rows4:
+        lines.append(f"    - {_fmt_row4(row)}")
+    lines += [
+        "  cam_overlaps: []",
+        "  camera_model: pinhole",
+        "  distortion_coeffs: [" + ", ".join(f"{v}" for v in dist) + "]",
+        f"  distortion_model: {cam_info['distortion_model']}",
+        "  intrinsics: [" + ", ".join(f"{v}" for v in intr) + "]",
+        f"  resolution: [{res[0]}, {res[1]}]",
+        f"  rostopic: {cam_info['rostopic']}",
+        "  timeshift_cam_imu: 0.0",
+    ]
+
+    yaml_text = "\n".join(lines) + "\n"
+    yaml_path = output_bag / "kalibr_imucam_chain.yaml"
     yaml_path.write_text(yaml_text, encoding="utf-8")
     return yaml_path
